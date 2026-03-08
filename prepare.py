@@ -1,35 +1,39 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time data preparation for RF-DETR autoresearch experiments.
+Downloads COCO 2017 val data for object detection / segmentation experiments.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data is stored in ~/.cache/autoresearch/.
 """
 
 import os
 import sys
 import time
+import json
+import zipfile
 import math
 import argparse
-import pickle
-from multiprocessing import Pool
+from pathlib import Path
 
 import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
 import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms as T
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+IMG_SIZE = 640          # input image size (square)
+TIME_BUDGET = 300       # training time budget in seconds (5 minutes)
+EVAL_IMAGES = 1000      # number of validation images for eval (fixed)
+NUM_CLASSES = 80        # COCO 80-category object detection
+NUM_QUERIES = 100       # number of object queries in the DETR decoder
+MAX_OBJECTS = 100       # maximum objects per image (padded to this length)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -37,352 +41,389 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+IMAGES_DIR = os.path.join(DATA_DIR, "val2017")
+ANN_DIR = os.path.join(DATA_DIR, "annotations")
+ANN_FILE = os.path.join(ANN_DIR, "instances_val2017.json")
+SPLIT_FILE = os.path.join(DATA_DIR, "split.json")
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+COCO_IMAGES_URL = "http://images.cocodataset.org/zips/val2017.zip"
+COCO_ANN_URL = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+NUM_TRAIN = 4000  # images reserved for training (rest = validation)
 
 # ---------------------------------------------------------------------------
 # Data download
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
+def _download_file(url, dest_path, description=""):
+    """Download a file with progress reporting. Returns True on success."""
+    if os.path.exists(dest_path):
+        print(f"  Already exists: {description or Path(dest_path).name}")
         return True
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    temp_path = dest_path + ".tmp"
+    print(f"  Downloading {description or url} ...")
+    try:
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        total = int(response.headers.get("content-length", 0))
+        downloaded = 0
+        t0 = time.time()
+        with open(temp_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        elapsed = time.time() - t0
+                        speed = downloaded / elapsed / 1024 ** 2 if elapsed > 0 else 0
+                        pct = 100 * downloaded / total
+                        print(
+                            f"\r    {pct:.1f}%  "
+                            f"({downloaded / 1024**2:.0f}/{total / 1024**2:.0f} MB  "
+                            f"{speed:.1f} MB/s)",
+                            end="",
+                            flush=True,
+                        )
+        print()
+        os.rename(temp_path, dest_path)
+        return True
+    except (requests.RequestException, IOError) as exc:
+        print(f"\n  Download failed: {exc}")
+        for p in [temp_path, dest_path]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        return False
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+def _extract_zip(zip_path, dest_dir, description=""):
+    """Extract a zip archive."""
+    print(f"  Extracting {description or Path(zip_path).name} ...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(dest_dir)
+    print(f"  Extracted to {dest_dir}")
+
+
+def download_data():
+    """Download COCO 2017 val images and annotations."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+    images_ready = os.path.exists(IMAGES_DIR) and len(list(Path(IMAGES_DIR).glob("*.jpg"))) > 100
+    ann_ready = os.path.exists(ANN_FILE)
+
+    if images_ready and ann_ready:
+        n = len(list(Path(IMAGES_DIR).glob("*.jpg")))
+        print(f"Data: {n} COCO val2017 images + annotations already at {DATA_DIR}")
+        _make_split()
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    print("Data: downloading COCO 2017 val ...")
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+    # Annotations (~242 MB zipped)
+    ann_zip = os.path.join(DATA_DIR, "annotations_trainval2017.zip")
+    if not _download_file(COCO_ANN_URL, ann_zip, "annotations_trainval2017.zip (~242 MB)"):
+        print("ERROR: failed to download annotations. Check network connectivity.")
         sys.exit(1)
+    if not ann_ready:
+        _extract_zip(ann_zip, DATA_DIR, "annotations")
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+    # Images (~778 MB zipped)
+    img_zip = os.path.join(DATA_DIR, "val2017.zip")
+    if not _download_file(COCO_IMAGES_URL, img_zip, "val2017.zip (~778 MB)"):
+        print("ERROR: failed to download val2017 images. Check network connectivity.")
+        sys.exit(1)
+    if not images_ready:
+        _extract_zip(img_zip, DATA_DIR, "val2017 images")
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    n = len(list(Path(IMAGES_DIR).glob("*.jpg")))
+    print(f"Data: {n} images ready at {IMAGES_DIR}")
+    _make_split()
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+
+def _make_split():
+    """Create and persist a deterministic train/val split of image IDs."""
+    if os.path.exists(SPLIT_FILE):
+        return
+    with open(ANN_FILE) as f:
+        data = json.load(f)
+    all_ids = sorted(img["id"] for img in data["images"])
+    # Deterministic split: first NUM_TRAIN for training, rest for validation
+    train_ids = all_ids[:NUM_TRAIN]
+    val_ids = all_ids[NUM_TRAIN : NUM_TRAIN + EVAL_IMAGES]
+    with open(SPLIT_FILE, "w") as f:
+        json.dump({"train": train_ids, "val": val_ids}, f)
+    print(f"Split: {len(train_ids)} train / {len(val_ids)} val images")
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+# ImageNet normalisation (standard for pretrained backbones)
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225]
+
+_TRAIN_TRANSFORM = T.Compose([
+    T.Resize((IMG_SIZE, IMG_SIZE)),
+    T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+    T.ToTensor(),
+    T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+])
+
+_EVAL_TRANSFORM = T.Compose([
+    T.Resize((IMG_SIZE, IMG_SIZE)),
+    T.ToTensor(),
+    T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+])
+
+
+class COCODetection(Dataset):
+    """
+    COCO detection dataset.  Returns image tensors and bounding-box targets.
+    Boxes are stored as [cx, cy, w, h] normalised to [0, 1].
+    """
+
+    def __init__(self, ann_file, images_dir, img_ids, augment=False):
+        with open(ann_file) as f:
+            data = json.load(f)
+
+        # category id → 0-indexed label
+        cats = sorted(data["categories"], key=lambda c: c["id"])
+        self._cat_to_label = {c["id"]: i for i, c in enumerate(cats)}
+
+        id_to_meta = {img["id"]: img for img in data["images"]}
+
+        # group annotations by image id
+        ann_by_img: dict[int, list] = {}
+        for ann in data["annotations"]:
+            iid = ann["image_id"]
+            ann_by_img.setdefault(iid, []).append(ann)
+
+        self._samples = []
+        for iid in img_ids:
+            if iid not in id_to_meta:
+                continue
+            meta = id_to_meta[iid]
+            self._samples.append(
+                dict(
+                    file=os.path.join(images_dir, meta["file_name"]),
+                    width=meta["width"],
+                    height=meta["height"],
+                    anns=ann_by_img.get(iid, []),
+                )
+            )
+
+        self._transform = _TRAIN_TRANSFORM if augment else _EVAL_TRANSFORM
+        self._augment = augment
+
+    def __len__(self):
+        return len(self._samples)
+
+    def __getitem__(self, idx):
+        s = self._samples[idx]
+        img = Image.open(s["file"]).convert("RGB")
+        W, H = img.size
+        img_t = self._transform(img)
+
+        # Optional horizontal flip
+        flip = self._augment and torch.rand(1).item() > 0.5
+        if flip:
+            img_t = torch.flip(img_t, dims=[2])
+
+        boxes, labels = [], []
+        for ann in s["anns"]:
+            if ann.get("iscrowd", 0):
+                continue
+            cat_id = ann["category_id"]
+            if cat_id not in self._cat_to_label:
+                continue
+            x, y, w, h = ann["bbox"]
+            if w < 1 or h < 1:
+                continue
+            cx = (x + w / 2) / W
+            cy = (y + h / 2) / H
+            nw = w / W
+            nh = h / H
+            if flip:
+                cx = 1.0 - cx
+            boxes.append([cx, cy, nw, nh])
+            labels.append(self._cat_to_label[cat_id])
+            if len(boxes) >= MAX_OBJECTS:
+                break
+
+        n = len(boxes)
+        boxes_t = torch.zeros(MAX_OBJECTS, 4, dtype=torch.float32)
+        labels_t = torch.full((MAX_OBJECTS,), -1, dtype=torch.long)
+        if n > 0:
+            boxes_t[:n] = torch.tensor(boxes, dtype=torch.float32)
+            labels_t[:n] = torch.tensor(labels, dtype=torch.long)
+        return img_t, boxes_t, labels_t, torch.tensor(n, dtype=torch.long)
+
+
+def _collate(batch):
+    images, boxes, labels, counts = zip(*batch)
+    return (
+        torch.stack(images),
+        torch.stack(boxes),
+        torch.stack(labels),
+        torch.stack(counts),
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(split, batch_size, num_workers=4, shuffle=None):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Build a DataLoader for the COCO detection dataset.
+
+    Args:
+        split: "train" or "val"
+        batch_size: images per batch
+        num_workers: DataLoader worker processes
+        shuffle: override shuffle default (True for train, False for val)
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    assert split in ("train", "val"), f"Unknown split: {split!r}"
+    assert os.path.exists(SPLIT_FILE), (
+        f"Split file not found at {SPLIT_FILE}. Run prepare.py first."
+    )
+    with open(SPLIT_FILE) as f:
+        split_data = json.load(f)
+    img_ids = split_data[split]
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+    dataset = COCODetection(
+        ann_file=ANN_FILE,
+        images_dir=IMAGES_DIR,
+        img_ids=img_ids,
+        augment=(split == "train"),
+    )
+    if shuffle is None:
+        shuffle = (split == "train")
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=_collate,
+        pin_memory=True,
+        drop_last=(split == "train"),
+    )
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
+def _box_cxcywh_to_xyxy(boxes):
+    """Convert [cx, cy, w, h] → [x1, y1, x2, y2]."""
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
+
+
+def _generalized_box_iou(boxes1, boxes2):
+    """
+    Generalised IoU between two sets of boxes (xyxy format).
+    Returns a [N, M] matrix.
+    """
+    # Intersection
+    inter_x1 = torch.max(boxes1[:, None, 0], boxes2[None, :, 0])
+    inter_y1 = torch.max(boxes1[:, None, 1], boxes2[None, :, 1])
+    inter_x2 = torch.min(boxes1[:, None, 2], boxes2[None, :, 2])
+    inter_y2 = torch.min(boxes1[:, None, 3], boxes2[None, :, 3])
+    inter_w = (inter_x2 - inter_x1).clamp(min=0)
+    inter_h = (inter_y2 - inter_y1).clamp(min=0)
+    inter_area = inter_w * inter_h
+
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    union_area = area1[:, None] + area2[None, :] - inter_area
+
+    iou = inter_area / union_area.clamp(min=1e-6)
+
+    # Enclosing box
+    enc_x1 = torch.min(boxes1[:, None, 0], boxes2[None, :, 0])
+    enc_y1 = torch.min(boxes1[:, None, 1], boxes2[None, :, 1])
+    enc_x2 = torch.max(boxes1[:, None, 2], boxes2[None, :, 2])
+    enc_y2 = torch.max(boxes1[:, None, 3], boxes2[None, :, 3])
+    enc_area = ((enc_x2 - enc_x1) * (enc_y2 - enc_y1)).clamp(min=1e-6)
+
+    giou = iou - (enc_area - union_area) / enc_area
+    return giou
+
+
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_l1(model, batch_size):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Average per-box L1 loss over the fixed validation set.
+    Uses Hungarian matching to pair each prediction to the nearest ground truth.
+    Lower is better.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError as exc:
+        raise ImportError("scipy is required for evaluate_l1. Run: pip install scipy") from exc
+
+    val_loader = make_dataloader("val", batch_size, num_workers=2, shuffle=False)
+
+    was_training = model.training
+    model.eval()
+    total_l1 = 0.0
+    total_boxes = 0
+
+    for images, boxes, labels, counts in val_loader:
+        images = images.cuda()
+        boxes = boxes.cuda()
+        labels = labels.cuda()
+
+        outputs = model(images)
+        pred_boxes = outputs["pred_boxes"]    # (B, Q, 4)
+        pred_logits = outputs["pred_logits"]  # (B, Q, num_classes+1)
+
+        B = images.shape[0]
+        for i in range(B):
+            n = counts[i].item()
+            if n == 0:
+                continue
+            tgt_boxes = boxes[i, :n]    # (n, 4)
+            tgt_labels = labels[i, :n]  # (n,)
+            pb = pred_boxes[i]           # (Q, 4)
+            pl = pred_logits[i]          # (Q, num_classes+1)
+
+            # Cost matrix
+            prob = pl.softmax(-1)
+            cls_cost = -prob[:, tgt_labels]                    # (Q, n)
+            l1_cost = torch.cdist(pb, tgt_boxes, p=1)         # (Q, n)
+            giou_cost = -_generalized_box_iou(
+                _box_cxcywh_to_xyxy(pb),
+                _box_cxcywh_to_xyxy(tgt_boxes),
+            )                                                  # (Q, n)
+            cost = 2.0 * cls_cost + 5.0 * l1_cost + 2.0 * giou_cost
+
+            pred_idx, tgt_idx = linear_sum_assignment(cost.cpu().float().numpy())
+
+            if len(pred_idx) > 0:
+                matched_pred = pb[torch.tensor(pred_idx, device=pb.device)]
+                matched_tgt = tgt_boxes[torch.tensor(tgt_idx, device=tgt_boxes.device)]
+                total_l1 += F.l1_loss(matched_pred, matched_tgt, reduction="sum").item()
+                total_boxes += len(pred_idx)
+
+    if was_training:
+        model.train()
+
+    return total_l1 / max(total_boxes, 1)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare COCO data for RF-DETR autoresearch")
     args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    download_data()
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
     print()
     print("Done! Ready to train.")
+
