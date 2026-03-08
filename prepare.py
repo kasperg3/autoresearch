@@ -26,7 +26,7 @@ from PIL import Image
 
 TIME_BUDGET = 300    # training time budget in seconds (5 minutes)
 IMG_SIZE    = 640    # input image size (square resize)
-NUM_CLASSES = 91     # COCO categories (1-indexed; 0 = background)
+NUM_CLASSES = 80     # COCO has 80 named object categories, mapped to labels [1, 80]
 MAX_QUERIES = 100    # default number of object queries for DETR
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ class COCODetection(Dataset):
     Returns (image, boxes, labels) where:
       image:  (3, IMG_SIZE, IMG_SIZE) float32, ImageNet-normalised
       boxes:  (M, 4) float32, normalised [cx, cy, w, h] in [0, 1]
-      labels: (M,)   int64, 1-indexed COCO class ids mapped to [1, 80]
+      labels: (M,)   int64, 1-indexed labels in [1, 80]
     """
 
     _MEAN = [0.485, 0.456, 0.406]

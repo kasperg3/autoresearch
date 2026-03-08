@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import torchvision.models as tvm
 from scipy.optimize import linear_sum_assignment
 
-from prepare import TIME_BUDGET, NUM_CLASSES, MAX_QUERIES, make_dataloader, evaluate_l1
+from prepare import TIME_BUDGET, NUM_CLASSES, MAX_QUERIES, DATA_DIR, make_dataloader, evaluate_l1
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (modify these)
@@ -278,9 +278,7 @@ optimizer = torch.optim.AdamW(
 
 # Use "val" split for training since prepare.py downloads val2017 by default.
 # Run `python prepare.py --train` first to use the full train2017 split.
-_train_split = "train" if os.path.isdir(
-    os.path.join(os.path.expanduser("~"), ".cache", "autoresearch", "coco", "train2017")
-) else "val"
+_train_split = "train" if os.path.isdir(os.path.join(DATA_DIR, "train2017")) else "val"
 train_loader = make_dataloader(_train_split, BATCH_SIZE, num_workers=4)
 train_iter   = iter(train_loader)
 
